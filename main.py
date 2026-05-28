@@ -6,7 +6,7 @@ from pathlib import Path
 from scipy.optimize import least_squares
 
 
-# ── Data loading ────────────────────────────────────────────────────────────
+# ── Physics helpers ────────────────────────────────────────────────────────
 
 def load_positioning_mat(path):
     data = sio.loadmat(path, squeeze_me=False)
@@ -21,48 +21,31 @@ def load_positioning_mat(path):
     return p_bs, d_hat, p
 
 
-# ── Physics-based positioning helpers ───────────────────────────────────────
-
 def inverse_distance_centroid(d, p_bs):
-    """역거리 가중 중심."""
     w = 1.0 / (d + 1e-6)
     return (p_bs * w).sum(axis=1) / w.sum()
 
 
 def robust_anchor_one(d, p_bs):
-    """Cauchy-robust 비선형 최소제곱으로 단일 사용자 위치 추정."""
     bs = p_bs.T
-    lo = p_bs.min(axis=1)
-    hi = p_bs.max(axis=1)
+    lo = p_bs.min(axis=1); hi = p_bs.max(axis=1)
     margin = np.maximum(0.2 * (hi - lo), 20.0)
     x0 = np.clip(inverse_distance_centroid(d, p_bs), lo - margin, hi + margin)
-
-    def residual(x):
-        return np.sqrt(np.sum((bs - x) ** 2, axis=1)) - d
-
-    result = least_squares(
-        residual, x0,
-        bounds=(lo - margin, hi + margin),
-        loss="cauchy", f_scale=5.0, max_nfev=80,
-    )
-    return result.x
+    def residual(x): return np.sqrt(np.sum((bs - x) ** 2, axis=1)) - d
+    r = least_squares(residual, x0, bounds=(lo - margin, hi + margin),
+                      loss='cauchy', f_scale=5.0, max_nfev=80)
+    return r.x
 
 
 def compute_robust_anchors(d_hat, p_bs):
-    """전체 사용자에 대해 robust anchor 계산 → (N, 2)."""
-    return np.vstack([
-        robust_anchor_one(d_hat[:, u], p_bs)
-        for u in range(d_hat.shape[1])
-    ])
+    return np.vstack([robust_anchor_one(d_hat[:, u], p_bs) for u in range(d_hat.shape[1])])
 
 
 def multilateration_wls(d, p_bs):
-    """가중 최소제곱 삼변측량."""
     x0, y0, d0 = p_bs[0, 0], p_bs[1, 0], d[0]
     A = 2 * (p_bs[:, 1:] - p_bs[:, :1]).T
     rhs = d0**2 - d[1:]**2 + np.sum(p_bs[:, 1:]**2, axis=0) - (x0**2 + y0**2)
-    w = 1.0 / (d[1:] + 1e-6)
-    W = np.diag(w)
+    w = 1.0 / (d[1:] + 1e-6); W = np.diag(w)
     try:
         return np.linalg.solve(A.T @ W @ A, A.T @ (W @ rhs))
     except np.linalg.LinAlgError:
@@ -70,90 +53,97 @@ def multilateration_wls(d, p_bs):
 
 
 def compute_multi(d_hat, p_bs):
-    """전체 사용자에 대해 WLS 삼변측량 → (N, 2)."""
-    N = d_hat.shape[1]
-    multi = np.zeros((N, 2))
-    for u in range(N):
-        multi[u] = multilateration_wls(d_hat[:, u], p_bs)
+    N = d_hat.shape[1]; multi = np.zeros((N, 2))
+    for u in range(N): multi[u] = multilateration_wls(d_hat[:, u], p_bs)
     return multi
+
+
+def compute_sub_anchors(d_hat, p_bs, k):
+    N = d_hat.shape[1]; raw = d_hat.T; result = np.zeros((N, 2))
+    for u in range(N):
+        idx = np.argsort(raw[u])[:k]
+        result[u] = robust_anchor_one(d_hat[idx, u], p_bs[:, idx])
+    return result
 
 
 # ── Feature engineering (train.py와 완전 동일) ────────────────────────────
 
 def make_features(d_hat, p_bs):
     """
-    101차원 feature vector 생성.
-    구성:
-      raw RTT         18  (기지국별 거리 측정값)
-      anchor          2   (Cauchy-robust 물리 추정 위치)
-      range_residual  18  (anchor 기준 예측 거리와의 차이)
-      abs_residual    18  (절댓값 잔차)
-      statistics      13  (mean, std, min, max, median, top-4 small, top-4 large)
-      WLS multi       2   (가중 삼변측량 위치)
-      weighted_cent   2   (역거리 가중 중심)
-      rank            18  (각 BS까지 정규화 순위: 0=가장 가까운, 1=가장 먼)
-      pair_diffs      10  (가장 가까운 5개 BS 거리 쌍 차이, C(5,2)=10)
-      ─────────────────
-      합계           101
+    187D feature vector (train.py와 동일 — 두 파일 반드시 동기화 유지).
     """
-    raw = d_hat.T           # (N, 18)
-    bs = p_bs.T             # (18, 2)
+    raw = d_hat.T; bs = p_bs.T
 
-    # 1) Cauchy-robust anchor
-    anchor = compute_robust_anchors(d_hat, p_bs)                              # (N, 2)
+    anchor = compute_robust_anchors(d_hat, p_bs)
 
-    # 2) Range residual
     anchor_ranges = np.sqrt(
         np.sum((anchor[:, None, :] - bs[None, :, :]) ** 2, axis=2)
-    )                                                                          # (N, 18)
-    range_residual = raw - anchor_ranges                                       # (N, 18)
+    )
+    range_residual = raw - anchor_ranges
 
-    # 3) WLS Multilateration
-    multi = compute_multi(d_hat, p_bs)                                        # (N, 2)
+    multi = compute_multi(d_hat, p_bs)
 
-    # 4) Inverse-distance weighted centroid
-    w = 1.0 / (raw + 1e-6)                                                    # (N, 18)
+    w_c = 1.0 / (raw + 1e-6)
     wcent = (
-        (w[:, :, None] * bs[None, :, :]).sum(axis=1)
-        / w.sum(axis=1, keepdims=True)
-    )                                                                          # (N, 2)
+        (w_c[:, :, None] * bs[None, :, :]).sum(axis=1)
+        / w_c.sum(axis=1, keepdims=True)
+    )
 
-    # 5) Order statistics
-    sorted_raw = np.sort(raw, axis=1)                                         # (N, 18)
+    sorted_raw = np.sort(raw, axis=1)
     stats = np.column_stack([
-        raw.mean(axis=1),
-        raw.std(axis=1),
-        raw.min(axis=1),
-        raw.max(axis=1),
-        np.median(raw, axis=1),
-        sorted_raw[:, :4],   # 4 smallest RTT
-        sorted_raw[:, -4:],  # 4 largest  RTT
-    ])                                                                         # (N, 13)
+        raw.mean(1), raw.std(1), raw.min(1), raw.max(1),
+        np.median(raw, 1), sorted_raw[:, :4], sorted_raw[:, -4:],
+    ])
 
-    # 6) Normalized distance rank (0=closest, 1=farthest)
     rank = (
         np.argsort(np.argsort(raw, axis=1), axis=1).astype(float)
         / (raw.shape[1] - 1)
-    )                                                                          # (N, 18)
+    )
 
-    # 7) Pairwise RTT differences of 5 closest BSes  C(5,2)=10
-    top5 = sorted_raw[:, :5]                                                  # (N, 5)
-    pair_diffs = np.column_stack([
+    top5 = sorted_raw[:, :5]
+    pair_diffs_5 = np.column_stack([
         top5[:, j] - top5[:, i]
         for i in range(5) for j in range(i + 1, 5)
-    ])                                                                         # (N, 10)
+    ])
+
+    irls_w = 1.0 / (np.abs(range_residual) + 5.0)
+    irls_w_norm = irls_w / (irls_w.sum(axis=1, keepdims=True) + 1e-8)
+
+    sa4 = compute_sub_anchors(d_hat, p_bs, k=4)
+    sa6 = compute_sub_anchors(d_hat, p_bs, k=6)
+    sa8 = compute_sub_anchors(d_hat, p_bs, k=8)
+
+    all_x = np.column_stack([anchor[:, 0], multi[:, 0], wcent[:, 0],
+                              sa4[:, 0], sa6[:, 0], sa8[:, 0]])
+    all_y = np.column_stack([anchor[:, 1], multi[:, 1], wcent[:, 1],
+                              sa4[:, 1], sa6[:, 1], sa8[:, 1]])
+    uncertainty = np.column_stack([
+        all_x.std(axis=1),
+        all_y.std(axis=1),
+        np.sqrt(np.sum((anchor - multi) ** 2, axis=1)),
+    ])
+
+    top8 = sorted_raw[:, :8]
+    pair_diffs_8 = np.column_stack([
+        top8[:, j] - top8[:, i]
+        for i in range(8) for j in range(i + 1, 8)
+    ])
+    ratio_8 = np.column_stack([
+        (top8[:, j] - top8[:, i]) / (top8[:, i] + top8[:, j] + 1e-6)
+        for i in range(8) for j in range(i + 1, 8)
+    ])
+
+    sa4_res = np.sqrt(np.sum((sa4 - anchor) ** 2, axis=1, keepdims=True))
+    sa6_res = np.sqrt(np.sum((sa6 - anchor) ** 2, axis=1, keepdims=True))
+    sa8_res = np.sqrt(np.sum((sa8 - anchor) ** 2, axis=1, keepdims=True))
 
     X = np.hstack([
-        raw,                    # 18
-        anchor,                 # 2
-        range_residual,         # 18
-        np.abs(range_residual), # 18
-        stats,                  # 13
-        multi,                  # 2
-        wcent,                  # 2
-        rank,                   # 18
-        pair_diffs,             # 10
-    ])                          # → (N, 101)
+        raw, anchor, range_residual, np.abs(range_residual),
+        stats, multi, wcent, rank, pair_diffs_5,
+        irls_w_norm, sa4, sa6, sa8, uncertainty,
+        pair_diffs_8, ratio_8,
+        sa4_res, sa6_res, sa8_res,
+    ])  # (N, 187)
 
     return X, anchor
 
@@ -162,29 +152,32 @@ def make_features(d_hat, p_bs):
 
 def your_algorithm(d_hat, p_bs):
     """
-    Physics-informed stacking 앙상블 측위 (잔차 학습).
+    PAANE: Physics-Anchored Adaptive NLOS Ensemble.
     model.pkl 로드 후 p_hat (2, num_user) 반환.
     """
     model_path = Path(__file__).parent.resolve() / 'model.pkl'
     with open(model_path, 'rb') as f:
         saved = pickle.load(f)
 
-    mtype = saved['type']
     X, anchor = make_features(d_hat, p_bs)
 
-    if mtype == 'stacked_residual':
-        # ★ 잔차 학습: base 예측(잔차) → meta → 최종 = anchor + 잔차
-        base_res = np.hstack([m.predict(X) for m in saved['base_models']])  # (N, n_models*2)
-        residual = saved['meta_model'].predict(base_res)                    # (N, 2)
-        p_hat = (anchor + residual).T                                       # (2, N)
+    mtype = saved['type']
+
+    if mtype == 'paane_v1':
+        base_res = np.hstack([m.predict(X) for m in saved['base_models']])
+        residual = saved['meta_model'].predict(base_res)
+        p_hat = (anchor + residual).T
+
+    elif mtype == 'stacked_residual':
+        base_res = np.hstack([m.predict(X) for m in saved['base_models']])
+        residual = saved['meta_model'].predict(base_res)
+        p_hat = (anchor + residual).T
 
     elif mtype == 'stacked':
-        # 이전 버전 호환
         base_preds = np.hstack([m.predict(X) for m in saved['base_models']])
         p_hat = saved['meta_model'].predict(base_preds).T
 
     else:
-        # 구버전 sklearn 단일 모델 fallback
         p_hat = saved['model'].predict(X).T
 
     return p_hat
@@ -193,18 +186,16 @@ def your_algorithm(d_hat, p_bs):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    # 스크립트 위치 기준으로 .mat 파일 탐색
-    # 채점기는 'DH_FR1.mat'을 같은 폴더에 배치, 로컬엔 'InF_DH_FR1.mat' 사용
     script_dir = Path(__file__).parent.resolve()
     candidates = [
         script_dir / 'DH_FR1.mat',
-        script_dir / 'InF_DH_FR1.mat',  # 로컬 테스트용 fallback
+        script_dir / 'InF_DH_FR1.mat',
     ]
     mat_path = next((str(p) for p in candidates if p.exists()), None)
     if mat_path is None:
         raise FileNotFoundError(
-            f"No .mat file found. Tried:\n" +
-            "\n".join(f"  {p}" for p in candidates)
+            'No .mat file found. Tried:\n' +
+            '\n'.join(f'  {p}' for p in candidates)
         )
 
     p_bs, d_hat, _ = load_positioning_mat(mat_path)
@@ -214,7 +205,7 @@ def main():
     p_hat = np.asarray(p_hat, dtype=float)
 
     if p_hat.shape != (2, num_user):
-        raise ValueError(f"p_hat must have shape (2, {num_user}), got {p_hat.shape}.")
+        raise ValueError(f'p_hat must have shape (2, {num_user}), got {p_hat.shape}.')
 
     return p_hat
 
@@ -223,40 +214,37 @@ if __name__ == '__main__':
     import time
 
     script_dir = Path(__file__).parent.resolve()
-    candidates = [
-        script_dir / 'DH_FR1.mat',
-        script_dir / 'InF_DH_FR1.mat',
-    ]
+    candidates = [script_dir / 'DH_FR1.mat', script_dir / 'InF_DH_FR1.mat']
     mat_path = next((str(p) for p in candidates if p.exists()), None)
     if mat_path is None:
-        raise FileNotFoundError("No .mat file found.")
+        raise FileNotFoundError('No .mat file found.')
 
-    # load_positioning_mat 으로 안전하게 로드
     import scipy.io as _sio
     _raw  = _sio.loadmat(mat_path, squeeze_me=False)
-    p_bs  = np.asarray(_raw['p_bs'] if 'p_bs' in _raw else _raw['BS_positions'], dtype=float)
+    if 'p_bs' in _raw:
+        p_bs = np.asarray(_raw['p_bs'], dtype=float)
+    else:
+        p_bs = np.asarray(_raw['BS_positions'], dtype=float)
     d_hat = np.asarray(_raw['d_hat'], dtype=float)
-    p_gt  = np.asarray(_raw['p'], dtype=float) if 'p' in _raw else None
+    p_gt  = np.asarray(_raw['p'],     dtype=float) if 'p' in _raw else None
 
     t0    = time.time()
     p_hat = your_algorithm(d_hat, p_bs)
     p_hat = np.asarray(p_hat, dtype=float)
     elapsed = time.time() - t0
 
-    print(f"\n{'='*40}")
-    print(f"  p_hat shape : {p_hat.shape}")
-    print(f"  실행 시간   : {elapsed:.2f} 초")
+    print(f'\n{"="*45}')
+    print(f'  p_hat shape : {p_hat.shape}')
+    print(f'  실행 시간   : {elapsed:.2f} 초')
 
     if p_gt is not None:
         errors = np.sqrt(np.sum((p_hat - p_gt) ** 2, axis=0))
-        print(f"\n  ── 측위 오차 (train set 700명) ──")
-        print(f"  Mean   : {errors.mean():.4f} m")
-        print(f"  Median : {np.median(errors):.4f} m")
-        print(f"  Std    : {errors.std():.4f} m")
-        print(f"  90th%  : {np.percentile(errors, 90):.4f} m")
-        print(f"  Max    : {errors.max():.4f} m")
-        print(f"\n  ※ 실제 채점은 hidden 300명 기준 (OOF ≈ 5.18 m 예상)")
+        print(f'\n  ── 측위 오차 (train set {d_hat.shape[1]}명) ──')
+        print(f'  Mean   : {errors.mean():.4f} m')
+        print(f'  Median : {np.median(errors):.4f} m')
+        print(f'  Std    : {errors.std():.4f} m')
+        print(f'  90th%  : {np.percentile(errors, 90):.4f} m')
+        print(f'  Max    : {errors.max():.4f} m')
     else:
-        print("  (정답 없음 — 채점기 환경)")
-    print(f"{'='*40}\n")
-
+        print('  (정답 없음 — 채점기 환경)')
+    print(f'{"="*45}\n')
